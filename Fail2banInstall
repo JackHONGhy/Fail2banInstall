@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# Fail2ban 自动部署脚本（终极完美版 - 修复依赖问题）
+# Fail2ban 自动部署脚本（终极修正版 - 修复依赖报错）
 # 适配：Ubuntu 20.04 / 22.04 / 24.04 / Debian 11+
-# 功能：自动端口、自动白名单、智能防火墙、Systemd 优化、自动清理
+# 修复：将虚拟包 awk 替换为实体包 gawk，解决安装报错
 # ============================================================
 
 set -euo pipefail
@@ -19,12 +19,11 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# ---------- 1. 系统与依赖检测 (核心修复) ----------
+# ---------- 1. 系统与依赖检测 (关键修复) ----------
 blue "检查系统依赖..."
 
-# 定义依赖列表 (注意：使用 gawk 代替虚拟包 awk)
-# 常用工具: curl, grep, sed, awk(gawk)
-# 核心组件: openssh-server, fail2ban, python3-systemd, lsb-release
+# 修复点：将 'awk' 改为 'gawk'。
+# awk 是虚拟包，直接安装会报错 "no installation candidate"。
 REQUIRED_PKGS="curl openssh-server fail2ban python3-systemd lsb-release grep gawk"
 MISSING_PKGS=""
 
@@ -48,7 +47,7 @@ green "当前系统: Ubuntu $UBUNTU_VERSION"
 
 # ---------- 2. 智能检测 SSH 端口 ----------
 blue "智能检测 SSH 端口..."
-# 使用 sshd -T 获取准确配置，处理多端口情况
+# 使用 sshd -T 获取准确配置
 if SSH_CONFIG_DUMP=$(sshd -T 2>/dev/null); then
     DETECTED_PORTS=$(echo "$SSH_CONFIG_DUMP" | grep '^port ' | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
     if [[ -n "$DETECTED_PORTS" ]]; then
@@ -66,7 +65,6 @@ fi
 # ---------- 3. 自动白名单配置 ----------
 blue "配置白名单..."
 IGNOREIP="127.0.0.1/8 ::1"
-# 获取当前 SSH 连接的 IP
 ADMIN_IP=$(echo "${SSH_CLIENT:-}" | awk '{print $1}')
 
 if [[ -n "$ADMIN_IP" ]]; then
@@ -78,10 +76,9 @@ fi
 
 # ---------- 4. 检测 Fail2ban 版本模式 ----------
 MODE="normal"
-# 获取版本号
 F2B_VER=$(fail2ban-client --version 2>/dev/null | grep -oE "v[0-9]+\.[0-9]+" || echo "v0.0")
 
-# 如果版本是 v0.11+ 或 v1.x，开启 aggressive 模式
+# v0.11+ 或 v1.x 开启 aggressive
 if [[ "$F2B_VER" =~ v0\.11 || "$F2B_VER" =~ v1\. ]]; then
     MODE="aggressive"
     green "已启用高级过滤模式: aggressive ($F2B_VER)"
@@ -91,7 +88,7 @@ fi
 
 # ---------- 5. 智能防火墙后端检测 ----------
 blue "检测防火墙后端..."
-BANACTION="iptables-multiport" # 默认兜底
+BANACTION="iptables-multiport" 
 
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
     BANACTION="ufw"
@@ -107,7 +104,6 @@ fi
 if [[ ! -d /var/log/journal ]]; then
     blue "开启 systemd 日志持久化..."
     mkdir -p /var/log/journal
-    # 修改 journald.conf 确保 Storage=persistent
     if [[ -f /etc/systemd/journald.conf ]]; then
          sed -i 's/^#Storage=auto/Storage=persistent/' /etc/systemd/journald.conf
          sed -i 's/^Storage=auto/Storage=persistent/' /etc/systemd/journald.conf
@@ -123,10 +119,9 @@ blue "写入 Fail2ban 配置..."
 JAIL_LOCAL="/etc/fail2ban/jail.local"
 JAIL_SSH="/etc/fail2ban/jail.d/sshd.local"
 
-# 备份旧文件
+# 备份
 [[ -f "$JAIL_LOCAL" ]] && cp "$JAIL_LOCAL" "$JAIL_LOCAL.bak.$(date +%s)"
 
-# 写入全局配置
 cat > "$JAIL_LOCAL" <<EOF
 [DEFAULT]
 ignoreip = $IGNOREIP
@@ -138,7 +133,6 @@ banaction_allports = $BANACTION
 backend = systemd
 EOF
 
-# 写入 SSH 专用配置
 cat > "$JAIL_SSH" <<EOF
 [sshd]
 enabled = true
@@ -149,7 +143,6 @@ EOF
 
 # ---------- 8. 重启 Fail2ban ----------
 blue "重启服务..."
-# 确保服务没被 mask
 systemctl unmask fail2ban >/dev/null 2>&1 || true
 
 if systemctl is-active --quiet fail2ban; then
@@ -160,23 +153,22 @@ fi
 # 开机自启
 systemctl enable fail2ban >/dev/null 2>&1
 
-# ---------- 9. 深度清理功能 ----------
+# ---------- 9. 深度清理功能 (含依赖清理) ----------
 blue "执行系统清理..."
 
-# 移除孤儿包
+# 自动移除孤儿依赖包
 apt-get autoremove -y >/dev/null 2>&1
 green "已清理无用的依赖包"
 
-# 清理缓存
+# 清理 apt 缓存
 apt-get clean >/dev/null 2>&1
 green "已清理 Apt 缓存"
 
-# 清理临时文件
+# 清理临时日志
 rm -f /tmp/fail2ban-install.log 2>/dev/null
 
 # ---------- 10. 完成与验证 ----------
 echo "=============================================================="
-# 等待 Socket 准备好
 sleep 2
 
 if fail2ban-client ping >/dev/null 2>&1; then
@@ -186,12 +178,12 @@ if fail2ban-client ping >/dev/null 2>&1; then
     echo -e "   - 过滤模式: \033[36m$MODE\033[0m"
     echo "=============================================================="
     
-    # 询问是否自毁脚本
+    # 交互式询问自删
     read -p "是否删除此安装脚本以保持目录整洁? [y/N] " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -f "$0"
-        green "脚本已删除。"
+        green "脚本已自毁。"
     else
         blue "脚本已保留。"
     fi
