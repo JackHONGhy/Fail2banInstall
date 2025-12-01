@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# ============================================================
+# Fail2ban 自动部署脚本（终极完美版 - 含自动清理）
+# 适配：Ubuntu 20.04 / 22.04 / 24.04
+# 功能：自动端口、自动白名单、智能防火墙、Systemd 优化、自动清理
+# ============================================================
+
+set -euo pipefail
+
+# ---------- 彩色输出 ----------
+green(){ echo -e "\033[32m[OK]\033[0m $*"; }
+yellow(){ echo -e "\033[33m[WARN]\033[0m $*"; }
+red(){ echo -e "\033[31m[ERR]\033[0m $*" >&2; }
+blue(){ echo -e "\033[36m[INFO]\033[0m $*"; }
+
+# ---------- 必须以 root 运行 ----------
+if [[ $EUID -ne 0 ]]; then
+    red "请使用 sudo 或 root 运行此脚本！"
+    exit 1
+fi
+
+# ---------- 系统与依赖检测 ----------
+blue "检查系统依赖..."
+# 优先安装 lsb-release
+MISSING_PKGS=""
+for pkg in curl openssh-server fail2ban python3-systemd lsb-release grep awk; do
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        MISSING_PKGS="$MISSING_PKGS $pkg"
+    fi
+done
+
+if [[ -n "$MISSING_PKGS" ]]; then
+    blue "安装缺失组件: $MISSING_PKGS"
+    apt-get update -qq
+    # shellcheck disable=SC2086
+    apt-get install -y $MISSING_PKGS
+else
+    green "基础依赖已满足"
+fi
+
+UBUNTU_VERSION=$(lsb_release -rs)
+green "当前系统: Ubuntu $UBUNTU_VERSION"
+
+# ---------- 检测 SSH 端口 (核心逻辑) ----------
+blue "智能检测 SSH 端口..."
+if SSH_CONFIG_DUMP=$(sshd -T 2>/dev/null); then
+    DETECTED_PORTS=$(echo "$SSH_CONFIG_DUMP" | grep '^port ' | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
+    if [[ -n "$DETECTED_PORTS" ]]; then
+        SSH_PORT="$DETECTED_PORTS"
+        green "成功检测 SSH 端口: $SSH_PORT"
+    else
+        yellow "未从配置中提取到端口，回退默认: 22"
+        SSH_PORT="22"
+    fi
+else
+    yellow "sshd 未运行，回退默认: 22"
+    SSH_PORT="22"
+fi
+
+# ---------- 自动白名单 ----------
+blue "配置白名单..."
+IGNOREIP="127.0.0.1/8 ::1"
+ADMIN_IP=$(echo "${SSH_CLIENT:-}" | awk '{print $1}')
+
+if [[ -n "$ADMIN_IP" ]]; then
+    IGNOREIP="$IGNOREIP $ADMIN_IP"
+    green "已将当前连接 IP 加入白名单: $ADMIN_IP"
+else
+    yellow "未检测到 SSH 来源 IP，仅添加本机白名单"
+fi
+
+# ---------- 检测 Fail2ban 模式 ----------
+MODE="normal"
+F2B_VER=$(fail2ban-client --version | grep -oE "v[0-9]+\.[0-9]+")
+if [[ "$F2B_VER" =~ v0\.11 || "$F2B_VER" =~ v1\. ]]; then
+    MODE="aggressive"
+    green "已启用高级过滤模式: aggressive ($F2B_VER)"
+fi
+
+# ---------- 智能防火墙后端检测 ----------
+blue "检测防火墙后端..."
+BANACTION="iptables-multiport" 
+
+if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
+    BANACTION="ufw"
+    green "检测到 UFW (Active)，使用 banaction = ufw"
+elif command -v nft >/dev/null; then
+    BANACTION="nftables-multiport"
+    green "检测到 nftables，使用 banaction = nftables-multiport"
+else
+    green "使用标准 iptables-multiport"
+fi
+
+# ---------- 持久化 systemd 日志 ----------
+if [[ ! -d /var/log/journal ]]; then
+    blue "开启 systemd 日志持久化..."
+    mkdir -p /var/log/journal
+    if [[ -f /etc/systemd/journald.conf ]]; then
+         sed -i 's/^#Storage=auto/Storage=persistent/' /etc/systemd/journald.conf
+         sed -i 's/^Storage=auto/Storage=persistent/' /etc/systemd/journald.conf
+         sed -i 's/^Storage=none/Storage=persistent/' /etc/systemd/journald.conf
+    fi
+    systemctl restart systemd-journald
+    green "systemd 日志持久化已启用"
+fi
+
+# ---------- 生成配置文件 ----------
+blue "写入 Fail2ban 配置..."
+
+JAIL_LOCAL="/etc/fail2ban/jail.local"
+JAIL_SSH="/etc/fail2ban/jail.d/sshd.local"
+
+# 备份
+[[ -f "$JAIL_LOCAL" ]] && cp "$JAIL_LOCAL" "$JAIL_LOCAL.bak.$(date +%s)"
+
+cat > "$JAIL_LOCAL" <<EOF
+[DEFAULT]
+ignoreip = $IGNOREIP
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+banaction = $BANACTION
+banaction_allports = $BANACTION
+backend = systemd
+EOF
+
+cat > "$JAIL_SSH" <<EOF
+[sshd]
+enabled = true
+port    = $SSH_PORT
+filter  = sshd
+mode    = $MODE
+EOF
+
+# ---------- 重启 Fail2ban ----------
+blue "重启服务..."
+if systemctl is-active --quiet fail2ban; then
+    systemctl reload fail2ban
+else
+    systemctl restart fail2ban
+fi
+systemctl enable fail2ban >/dev/null 2>&1
+
+# ---------- 深度清理功能 ----------
+blue "执行系统清理..."
+
+# 1. 自动移除不再需要的依赖包
+apt-get autoremove -y >/dev/null 2>&1
+green "已清理无用的依赖包"
+
+# 2. 清理 apt 缓存
+apt-get clean >/dev/null 2>&1
+green "已清理 Apt 缓存"
+
+# 3. 清理可能的临时文件
+rm -f /tmp/fail2ban-install.log 2>/dev/null
+
+# ---------- 完成验证 ----------
+echo "=============================================================="
+sleep 2 # 等待 Socket
+if fail2ban-client ping >/dev/null 2>&1; then
+    green "Fail2ban 部署成功！"
+    echo -e "   - 监控端口: $SSH_PORT"
+    echo -e "   - 封禁动作: $BANACTION"
+    echo -e "   - 过滤模式: $MODE"
+    echo "=============================================================="
+    
+    # 询问是否删除脚本自身
+    read -p "是否删除此安装脚本以保持目录整洁? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm -f "$0"
+        green "脚本已自毁。"
+    else
+        blue "脚本已保留。"
+    fi
+else
+    red "Fail2ban 启动异常，请检查: sudo journalctl -u fail2ban"
+fi
